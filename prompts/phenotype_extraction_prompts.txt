@@ -1,0 +1,282 @@
+### 4 step extractor (+1 step extra for prior event extraction) All models using Opus 4.6. Summarizer, Extractor, Validator, and Enrollment checker.
+
+
+> SUMMARIZER PROMPT <
+"""
+You will be given a clinical note for a Rett syndrome patient. Your task is to extract ONLY the portions of the note that describe information related to Daybue (trofinetide) medication.
+
+INCLUDE sections that mention:
+
+- Daybue/trofinetide administration or dosing
+- Patient response to Daybue (improvements or lack thereof)
+- Side effects or adverse reactions to Daybue
+- Changes in symptoms after starting/stopping Daybue
+- Clinical observations related to Daybue treatment
+- Parent/caregiver reported changes associated with Daybue
+
+EXCLUDE sections about:
+
+- Other medications (unless directly comparing to Daybue)
+- Symptoms/observations unrelated to Daybue treatment
+- General medical history not connected to Daybue
+- Diagnostic information unrelated to medication response
+
+OUTPUT REQUIREMENTS:
+
+- Return ONLY the extracted text passages verbatim (preserve original language)
+- If multiple relevant sections exist, extract all of them
+- Maintain the original formatting and wording
+- If no Daybue-related information exists, return: "No Daybue-related information found"
+- Do not summarize, paraphrase, or translate the content
+"""
+
+> EXTRACTOR PROMPT <
+"""
+TASK
+You will be provided with a clinical note. Extract only the phenotype specified below and return results in JSON format.
+
+PHENOTYPE TO EXTRACT: Diarrhea
+
+DIARRHEA SEVERITY LEVELS (if present):
+- Level 1: Loose stool in diaper
+- Level 2: Watery stool in diaper
+- Level 3: Watery stool on clothes
+- Level 4: Watery stool outside clothes
+
+TEMPORAL RULES
+- If a date is explicitly mentioned alongside the finding, convert it to M/D/YY format
+  Examples: "Feb 2024" → "2/1/24" | "February 15, 2024" → "2/15/24" | "12/5/2023" → "12/5/23"
+- Clinical notes may reference multiple visits — only extract the date directly associated with the diarrhea mention
+- If no date is mentioned, set time to null
+- Do NOT infer or calculate dates
+
+OUTPUT FORMAT
+Return results as a JSON array:
+
+[
+  {
+    "phenotype": "Diarrhea",
+    "present": "Yes/No",
+    "severity_level": "1/2/3/4 or N/A",
+    "time": "M/D/YY or null",
+    "evidence_text": "Exact 1-2 sentences from the note supporting this finding"
+  }
+]
+
+INSTRUCTIONS
+1. Only extract what is explicitly mentioned in the note
+2. If diarrhea is not mentioned at all, return present: "No" with time and evidence_text set to null
+3. If diarrhea is mentioned at multiple timepoints, create a separate entry for each
+4. Always include 1-2 exact sentences from the note as evidence_text
+"""
+
+> VALIDATOR PROMPT <
+"""
+ROLE
+You are a medical validation system. You will receive a clinical note and a JSON extraction produced by another LLM. Your job is to validate each entry and return a corrected JSON in the exact same structure as the input.
+
+You will receive:
+- ORIGINAL_NOTE: The raw clinical note
+- EXTRACTION: A JSON array of extracted phenotype findings
+
+---
+
+SCOPE
+- Only validate and return entries where present = "Yes"
+- Entries where present = "No" must be excluded from output entirely
+
+---
+
+VALIDATION TASKS
+
+1. EVIDENCE VERIFICATION
+- Locate the evidence_text in the original note — wording must be substantially verbatim (minor punctuation differences allowed)
+- If the quote is slightly off but supporting text exists: FIX the quote to match the note exactly
+- If no supporting text can be found: REMOVE the entry
+
+2. PRESENCE VALIDATION
+- Confirm the evidence_text clearly describes the phenotype being claimed
+- If the evidence does not support present = "Yes": REMOVE the entry
+
+3. SEVERITY / LEVEL VALIDATION
+
+For Diarrhea severity_level — match evidence to:
+  Level 1: loose stool in diaper
+  Level 2: watery stool in diaper
+  Level 3: watery stool on clothes
+  Level 4: watery stool outside clothes
+  N/A: no severity detail present in evidence
+
+For all other phenotypes: severity_level must be "N/A"
+
+For improvement level — match evidence language to:
+  low:      slight, a little, minimal, somewhat
+  moderate: improved, better, noticeable, more than before
+  high:     much better, significantly, dramatically, great improvement
+  N/A:      no intensity language present
+
+If the assigned value does not match the evidence: FIX it. If it cannot be determined: set to "N/A".
+
+4. TEMPORAL VALIDATION
+- Confirm the date is explicitly stated in the note near the phenotype mention
+- If the date appears in the note but refers to a different visit or unrelated context: set to null
+- If the date is not found in the note: set to null
+- Format must be M/D/YY (no leading zeros, two-digit year)
+  Examples: "Feb 2024" → "2/1/24" | "February 15, 2024" → "2/15/24" | "12/5/2023" → "12/5/23"
+- If format is wrong: FIX to M/D/YY
+
+---
+
+DECISION RULES
+
+REMOVE if:
+- Evidence cannot be found or matched in the note
+- Evidence does not support the phenotype
+- Entry is a duplicate (same phenotype, same time)
+
+FIX if:
+- Evidence quote is slightly off but correct text exists in the note
+- Severity/level does not match evidence but can be corrected
+- Date format is wrong or date belongs to a different visit context
+
+KEEP if:
+- Evidence is verbatim and clearly supports the phenotype
+- Severity/level matches the evidence
+- Date is accurate and contextually tied to the phenotype, or correctly null
+
+---
+
+OUTPUT FORMAT
+Return ONLY a valid JSON array in the exact same structure as the input. No explanation, no commentary, no markdown — just the JSON.
+
+[
+  {
+    "phenotype": "string",
+    "present": "Yes",
+    "severity_level": "1/2/3/4 or N/A",
+    "time": "M/D/YY or null",
+    "evidence_text": "verbatim quote from note"
+  }
+]
+
+If no entries pass validation, return an empty array: []
+"""
+
+> ENROLLMENT CHECKER < 
+"""
+You are a clinical research assistant reviewing a single clinical note for a Rett syndrome patient enrolled in a trofinetide (Daybue) medication study.
+
+Your task is to extract ONLY what this specific note explicitly states about whether the patient has started, is currently on, or has stopped Daybue/trofinetide.
+You will NOT infer across notes. You report only what THIS note says.
+
+---
+
+DEFINITIONS (apply strictly):
+
+- "confirmed_start": The note contains clear evidence the patient HAS taken or IS actively taking Daybue (e.g., "started Daybue", "on Daybue", "taking trofinetide", "dose increased", side effects or improvements reported while on Daybue, titration language).
+- "confirmed_end": The note contains clear evidence the patient STOPPED Daybue (e.g., "discontinued", "stopped Daybue", "no longer on trofinetide", "Daybue was stopped due to...").
+- "planned_only": Daybue is mentioned only as a future plan, consideration, or pending action with no evidence it was actually taken (e.g., "will start Daybue", "planning to start", "discussed Daybue", "sent prior auth", "prior authorization submitted").
+- "denied": The note explicitly states insurance denied, prescription was rejected, or access was blocked — and there is no evidence the patient obtained or took the medication anyway.
+- "no_mention": Daybue/trofinetide is not mentioned in this note at all.
+- "deceased_or_ineligible": The note indicates the patient died, was terminally ill, or otherwise could never have started (e.g., "patient passed away", "requiring prolonged hospitalization", "transitioned to palliative care").
+- "ambiguous": Daybue is mentioned but you genuinely cannot determine from this note alone whether it was taken, planned, or denied. Use sparingly — always set confidence = "low".
+
+---
+
+DATE EXTRACTION RULES:
+
+- Extract explicit dates in M/D/YY format (no leading zeros, two-digit year)
+  Examples: "Feb 2024" → "2/1/24" | "February 15, 2024" → "2/15/24" | "12/5/2023" → "12/5/23"
+- confirmed_start_date: only if an explicit start date for Daybue is stated in this note
+- confirmed_end_date: only if an explicit discontinuation date is stated in this note
+- Do NOT infer or calculate dates — only extract what is explicitly written
+- If confirmed but no date given: set the date field to null
+
+---
+
+RULES:
+
+1. confirmed_start = true ONLY if the patient demonstrably took the medication. Side effects, dose changes, titration notes, and caregiver-reported responses while on Daybue all count.
+2. confirmed_start = false if the note only discusses plans, prior authorizations, insurance submissions, or future intentions — even if language sounds certain ("we will start next month" → false).
+3. Insurance denial followed by evidence the patient later obtained the medication in the SAME note → confirmed_start = true, enrollment_status = "confirmed_start".
+4. A note can have BOTH confirmed_start = true AND confirmed_end = true if it references both events (e.g., "Patient started Daybue in March but discontinued in June").
+5. evidence_text must be a verbatim quote from the note — not a paraphrase. Include the minimum sentences needed to justify your classification. Set to null if enrollment_status = "no_mention".
+
+---
+
+OUTPUT FORMAT (return valid JSON only, no extra text):
+
+{
+  "confirmed_start": true/false,
+  "confirmed_start_date": "M/D/YY or null",
+  "confirmed_end": true/false,
+  "confirmed_end_date": "M/D/YY or null",
+  "confidence": "high | medium | low",
+  "evidence_text": "Verbatim quote(s) from the note. null if no_mention."
+}
+
+---
+
+CLINICAL NOTE:
+"""
+
+> PRIOR EVENTS PROMPT <
+"""
+TASK
+You will be provided with a clinical note. Extract only the phenotype specified below and return results in JSON format.
+
+PHENOTYPE TO EXTRACT: Chronic / Recurrent Diarrhea
+
+DEFINITION — WHAT QUALIFIES
+Only extract diarrhea mentions that meet at least ONE of the following criteria:
+- Explicitly described as "chronic," "persistent," "ongoing," or "recurrent"
+- Documented across two or more separate dates or visits
+- Described with language implying prolonged duration (e.g., "diarrhea for several weeks," "loose stools for the past 3 months," "continued diarrhea," "long-standing diarrhea")
+- Listed as a chronic or active problem in a problem list
+- Associated with a workup or concern for an underlying condition (e.g., malabsorption, IBD, celiac, infection workup due to persistent symptoms)
+
+DEFINITION — WHAT TO IGNORE
+Do NOT extract diarrhea mentions that are:
+- A single isolated episode with no indication of recurrence or chronicity
+- Clearly acute and self-limited (e.g., "had one episode of diarrhea after eating, resolved same day")
+- Mentioned only in the context of a normal/expected medication side effect that resolved
+- Mentioned only as a potential risk or educational warning (e.g., "call if you develop diarrhea")
+- Noted as part of a past illness that fully resolved with no ongoing concern
+
+DIARRHEA SEVERITY LEVELS (if described):
+- Level 1: Loose stool in diaper
+- Level 2: Watery stool in diaper
+- Level 3: Watery stool on clothes
+- Level 4: Watery stool outside clothes
+- If the note does not describe severity in terms that map to these levels, set severity_level to "N/A"
+
+TEMPORAL RULES
+- If a date is explicitly mentioned alongside the finding, convert it to M/D/YY format
+  Examples: "Feb 2024" → "2/1/24" | "February 15, 2024" → "2/15/24" | "12/5/2023" → "12/5/23"
+- If a relative time reference is given (e.g., "for the past 3 months"), record it as-is in a "time_description" field and set "time" to null
+- Clinical notes may reference multiple visits — only extract the date directly associated with the diarrhea mention
+- If no date or time reference is mentioned, set time to null and time_description to null
+- Do NOT infer or calculate dates from relative references
+
+OUTPUT FORMAT
+Return results as a JSON array:
+[
+  {
+    "phenotype": "Chronic/Recurrent Diarrhea",
+    "present": "Yes/No",
+    "chronicity_indicator": "chronic/recurrent/persistent/prolonged or null",
+    "severity_level": "1/2/3/4 or N/A",
+    "time": "M/D/YY or null",
+    "time_description": "relative time phrase from note if no exact date, or null",
+    "evidence_text": "Exact 1-2 sentences from the note supporting this finding"
+  }
+]
+
+INSTRUCTIONS
+1. Only extract what is explicitly mentioned in the note — do not infer chronicity unless the language clearly supports it.
+2. If diarrhea is not mentioned at all, OR if it is mentioned only as an acute/isolated/resolved episode, return:
+   [{"phenotype": "Chronic/Recurrent Diarrhea", "present": "No", "chronicity_indicator": null, "severity_level": "N/A", "time": null, "time_description": null, "evidence_text": null}]
+3. If chronic or recurrent diarrhea is mentioned at multiple timepoints, create a separate entry for each.
+4. Always include 1-2 exact sentences from the note as evidence_text.
+5. If the same diarrhea episode is described across multiple sentences, pick the 1-2 most informative sentences.
+"""

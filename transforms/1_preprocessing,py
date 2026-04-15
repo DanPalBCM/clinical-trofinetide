@@ -1,0 +1,178 @@
+"""
+Palantir Foundry PySpark Transform: Extract Patient Notes with Medication Timeline
+Purpose: Get notes mentioning medication for <provider_name> patients, marking medication start date
+"""
+from pyspark.sql import functions as F
+from pyspark.sql import Window
+from pyspark.sql.types import ArrayType, StringType, StructType, StructField
+from transforms.api import transform_df, Input, Output
+
+@transform_df(
+    Output("ri.foundry.main.dataset.xxxxx"),
+    patient_mrns=Input("ri.foundry.main.dataset.xxxxx"),
+    notes=Input("ri.foundry.main.dataset.xxxxx"),
+    mrn_patient_id_mapping=Input("ri.foundry.main.dataset.xxxxx")
+)
+def compute(patient_mrns, notes, mrn_patient_id_mapping):
+    """
+    Extract notes mentioning medication for <provider_name> patients.
+    Marks medication mentions and calculates medication start date.
+    
+    Key filtering:
+    - Only patients from Provider "<provider_name>"
+    - Only notes mentioning "daybue" or "trofinetide"
+    - Includes notes from Sept 2022 onwards (to capture 6 months pre-medication)
+    
+    Chunking:
+    - Applied at the end, after all filters and deduplication
+    - Max 200,000 characters per chunk (conservative proxy for 200k tokens)
+    - Notes within limit are unchanged
+    - Notes exceeding limit are split into multiple rows with note_id suffixed _chunked_1, _chunked_2, etc.
+    """
+
+    # -------------------------------------------------------------------------
+    # Step 1: Get list of MRNs from the patient list
+    # -------------------------------------------------------------------------
+    mrn_list = patient_mrns.select(
+        F.col("MRN").cast("string").alias("mrn")
+    ).distinct()
+
+    # -------------------------------------------------------------------------
+    # Step 2: Get patient_id to MRN mapping, standardize to string
+    # -------------------------------------------------------------------------
+    mapping = mrn_patient_id_mapping.select(
+        F.col("patient_id").cast("string").alias("patient_id"),
+        F.col("mrn").cast("string").alias("mrn")
+    ).distinct()
+
+    # -------------------------------------------------------------------------
+    # Step 3: Join mapping with our patient list to get relevant patient_ids
+    # -------------------------------------------------------------------------
+    relevant_patient_ids = mrn_list.join(
+        mapping,
+        on="mrn",
+        how="inner"
+    ).select("patient_id", "mrn").distinct()
+
+    # -------------------------------------------------------------------------
+    # Step 4: Filter notes by date - include from Sept 2022 to capture 6 months
+    # pre-medication (March 2023 - 6 months = Sept 2022)
+    # -------------------------------------------------------------------------
+    notes_filtered_date = notes.filter(
+        F.col("contact_date") >= F.lit("2022-09-01")
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 5: Standardize patient_id in notes and join with relevant patients
+    # -------------------------------------------------------------------------
+    notes_filtered_date = notes_filtered_date.withColumn(
+        "patient_id", F.col("patient_id").cast("string")
+    )
+
+    notes_our_patients = notes_filtered_date.join(
+        relevant_patient_ids,
+        on="patient_id",
+        how="inner"
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 6: Filter to only notes mentioning medication (daybue or trofinetide)
+    # -------------------------------------------------------------------------
+    notes_with_medication = notes_our_patients.filter(
+        F.lower(F.col("note_text")).contains("daybue") |
+        F.lower(F.col("note_text")).contains("trofinetide")
+    )
+
+    notes_with_flag = notes_with_medication.withColumn(
+        "medication_mentioned", F.lit(1)
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 7: Calculate first medication mention date per patient
+    # -------------------------------------------------------------------------
+    window_med_start = Window.partitionBy("mrn").orderBy("contact_date")
+
+    notes_with_med_start = notes_with_flag.withColumn(
+        "first_medication_mention_date",
+        F.when(
+            F.col("medication_mentioned") == 1,
+            F.col("contact_date")
+        ).otherwise(None)
+    )
+
+    notes_with_med_start = notes_with_med_start.withColumn(
+        "medication_start_date",
+        F.first(
+            F.col("first_medication_mention_date"),
+            ignorenulls=True
+        ).over(
+            window_med_start.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 8: Filter to include only notes from 6 months before medication start
+    # -------------------------------------------------------------------------
+    final_notes = notes_with_med_start.filter(
+        F.col("medication_start_date").isNull() |
+        (F.months_between(F.col("contact_date"), F.col("medication_start_date")) >= -6)
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 9: Drop duplicates before chunking
+    # -------------------------------------------------------------------------
+    final_notes = final_notes.dropDuplicates()
+
+    # -------------------------------------------------------------------------
+    # Step 10: Chunking
+    # Notes within 200,000 characters are passed through unchanged.
+    # Notes exceeding the limit are split into multiple rows, with note_id
+    # suffixed as _chunked_1, _chunked_2, etc. All other columns are preserved.
+    # -------------------------------------------------------------------------
+    MAX_CHARS = 600000
+
+    # Capture all column names so we can reconstruct the schema after explode
+    all_cols = final_notes.columns  # includes note_id and note_text
+
+    # Build a list of (note_id, note_text) chunk pairs using a UDF
+    # Each element in the array is a struct: {note_id, note_text}
+    chunk_schema = ArrayType(
+        StructType([
+            StructField("note_id", StringType(), True),
+            StructField("note_text", StringType(), True),
+        ])
+    )
+
+    @F.udf(chunk_schema)
+    def chunk_note(note_id, note_text):
+        if note_text is None:
+            return [{"note_id": note_id, "note_text": note_text}]
+        if len(note_text) <= MAX_CHARS:
+            # No chunking needed - return as-is
+            return [{"note_id": str(note_id), "note_text": note_text}]
+        # Split into chunks
+        chunks = []
+        total_chunks = (len(note_text) + MAX_CHARS - 1) // MAX_CHARS
+        for i in range(total_chunks):
+            chunk_text = note_text[i * MAX_CHARS:(i + 1) * MAX_CHARS]
+            chunk_id = "{}_chunked_{}".format(str(note_id), i + 1)
+            chunks.append({"note_id": chunk_id, "note_text": chunk_text})
+        return chunks
+
+    # Add chunks array column, then explode into rows
+    # Drop original note_id and note_text before exploding to avoid conflicts
+    other_cols = [c for c in all_cols if c not in ("note_id", "note_text")]
+
+    chunked = (
+        final_notes
+        .withColumn("_chunks", chunk_note(F.col("note_id"), F.col("note_text")))
+        .drop("note_id", "note_text")
+        .withColumn("_chunk", F.explode(F.col("_chunks")))
+        .drop("_chunks")
+        .withColumn("note_id", F.col("_chunk.note_id"))
+        .withColumn("note_text", F.col("_chunk.note_text"))
+        .drop("_chunk")
+        .select(all_cols)  # restore original column order
+    )
+
+    return chunked

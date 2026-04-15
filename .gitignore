@@ -1,0 +1,22 @@
+# Data files — never push PHI
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.json
+*.tsv
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
